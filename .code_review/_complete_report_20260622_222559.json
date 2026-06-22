@@ -1,0 +1,394 @@
+{
+  "generated_at": "20260622_222559",
+  "files_reviewed": ["C:/_Adi/_Work/_testing/claude-code-proxy/server.py"],
+  "all_issues_by_category": {
+    "Security": [
+      {
+        "category": "Security",
+        "severity": "Critical",
+        "title": "API keys and credentials may be leaked in error logs and tracebacks",
+        "location": "server.py:882-907",
+        "description": "The exception handler walks the entire exception object via `sanitize()` and dumps it with `json.dumps(..., indent=2)`. Many LiteLLM exception objects carry `api_key`, `api_base`, and full request payloads as attributes (`message`, `response`). These are written into the server log at ERROR level.",
+        "impact": "Credential leakage via logs is one of the most common real-world secrets exposures. A single DEBUG or ERROR dump of an upstream 401 will surface the configured API key.",
+        "current_code": "error_details = {\"error\": str(e), \"type\": type(e).__name__, \"traceback\": traceback.format_exc()}\nfor attr in (\"message\", \"status_code\", \"response\", \"llm_provider\", \"model\"):\n    if hasattr(e, attr):\n        error_details[attr] = getattr(e, attr)",
+        "fixed_code": "SENSITIVE_ATTRS = {\"api_key\", \"authorization\", \"x-api-key\", \"api_base\", \"password\", \"secret\"}\n\ndef _sanitize(obj, _seen=None):\n    if _seen is None:\n        _seen = set()\n    if isinstance(obj, dict):\n        return {\n            k: (\"***REDACTED***\" if k.lower() in SENSITIVE_ATTRS else _sanitize(v, _seen))\n            for k, v in obj.items()\n        }\n    if isinstance(obj, list):\n        return [_sanitize(i, _seen) for i in obj]\n    if hasattr(obj, \"__dict__\"):\n        oid = id(obj)\n        if oid in _seen:\n            return \"<recursion>\"\n        _seen.add(oid)\n        return _sanitize(obj.__dict__, _seen)\n    return obj\n\nlogger.error(\"Error: %s\", json.dumps(_sanitize(error_details), indent=2))",
+        "explanation": "An explicit deny-list for credential-bearing attribute names prevents the most common forms of accidental key leakage."
+      },
+      {
+        "category": "Security",
+        "severity": "Critical",
+        "title": "No authentication or authorization on proxy endpoints",
+        "location": "server.py:753-949, 961",
+        "description": "Both `/v1/messages` and `/v1/messages/count_tokens` accept arbitrary unauthenticated requests. The server binds to `0.0.0.0:8082`, so any reachable client can call the proxy and consume the configured provider quota.",
+        "impact": "A proxy that holds paid API credentials but exposes its own endpoints without auth is an open relay for abuse. Any caller can spend the operator's money, trigger rate-limit bans, or exfiltrate responses.",
+        "current_code": "@app.post(\"/v1/messages\")\nasync def create_message(request: MessagesRequest, raw_request: Request):\n    ...\n\nif __name__ == \"__main__\":\n    uvicorn.run(app, host=\"0.0.0.0\", port=8082, log_level=\"error\")",
+        "fixed_code": "from fastapi import Depends, Header\nimport hmac\n\nPROXY_API_KEY = os.environ.get(\"PROXY_API_KEY\")\n\nasync def require_proxy_key(\n    x_api_key: Optional[str] = Header(None, alias=\"x-api-key\"),\n    authorization: Optional[str] = Header(None),\n):\n    if not PROXY_API_KEY:\n        raise HTTPException(status_code=503, detail=\"proxy auth not configured\")\n    candidate = x_api_key or (authorization or \"\").removeprefix(\"Bearer \").strip()\n    if not hmac.compare_digest(candidate, PROXY_API_KEY):\n        raise HTTPException(status_code=401, detail=\"invalid api key\")\n\n@app.post(\"/v1/messages\", dependencies=[Depends(require_proxy_key)])\nasync def create_message(request: MessagesRequest, raw_request: Request):\n    ...",
+        "explanation": "The proxy holds spend-bearing credentials, so it must demand a credential of its own. hmac.compare_digest avoids timing attacks."
+      },
+      {
+        "category": "Security",
+        "severity": "High",
+        "title": "Server-side request forgery (SSRF) via configurable base_url",
+        "location": "server.py:773-798",
+        "description": "`providers.*.base_url` is read from `config.json` with no scheme/host validation. An attacker who can write to the config can point `base_url` at internal URLs (cloud metadata services, internal admin panels).",
+        "impact": "SSRF lets an attacker probe internal network endpoints using the proxy's identity, potentially reaching cloud metadata services that leak IAM credentials.",
+        "current_code": "elif PREFERRED_PROVIDER == \"openai\":\n    if cfg.get(\"base_url\"):\n        litellm_req[\"api_key\"] = cfg.get(\"api_key\") or \"\"\n        litellm_req[\"api_base\"] = cfg[\"base_url\"]",
+        "fixed_code": "from urllib.parse import urlparse\nimport ipaddress, socket\n\nBLOCKED_NETWORKS = [ipaddress.ip_network(n) for n in (\n    \"127.0.0.0/8\", \"10.0.0.0/8\", \"172.16.0.0/12\",\n    \"192.168.0.0/16\", \"169.254.0.0/16\", \"::1/128\", \"fc00::/7\",\n)]\n\ndef _validate_base_url(url: str) -> None:\n    p = urlparse(url)\n    if p.scheme not in {\"https\", \"http\"}:\n        raise ValueError(f\"base_url scheme {p.scheme!r} not allowed\")\n    host = p.hostname\n    if not host:\n        raise ValueError(\"base_url missing host\")\n    for info in socket.getaddrinfo(host, None):\n        ip = ipaddress.ip_address(info[4][0])\n        if any(ip in net for net in BLOCKED_NETWORKS):\n            raise ValueError(f\"base_url resolves to blocked network {ip}\")",
+        "explanation": "Validates the base URL at startup against a deny-list of private/link-local IP ranges. Defense in depth for shared-host threat models."
+      },
+      {
+        "category": "Security",
+        "severity": "High",
+        "title": "Client-supplied API key forwarded directly to upstream providers (auth bypass)",
+        "location": "server.py:757, 803-808",
+        "description": "When `preferred_provider == \"anthropic\"`, the server reads `x-api-key` or `authorization: Bearer ...` from the inbound request and uses it verbatim as the upstream Anthropic credential, bypassing operator-controlled credentials.",
+        "impact": "Authorization bypass: an attacker can substitute their own Anthropic key and have the proxy route traffic through it, hiding their origin.",
+        "current_code": "client_api_key = raw_request.headers.get(\"x-api-key\") or raw_request.headers.get(\"authorization\", \"\").replace(\"Bearer \", \"\")\n...\nelif PREFERRED_PROVIDER == \"anthropic\":\n    if client_api_key:\n        litellm_req[\"api_key\"] = client_api_key\n    elif cfg.get(\"api_key\"):\n        litellm_req[\"api_key\"] = cfg[\"api_key\"]",
+        "fixed_code": "# Remove the client-key fallback entirely; always use the server-configured key.\nelif PREFERRED_PROVIDER == \"anthropic\":\n    if not cfg.get(\"api_key\"):\n        raise HTTPException(status_code=503, detail=\"anthropic provider not configured\")\n    litellm_req[\"api_key\"] = cfg[\"api_key\"]\n    if client_api_key:\n        logger.warning(\"ignoring client-provided api_key for anthropic upstream\")",
+        "explanation": "The inbound credential should never determine the upstream credential. If client-key forwarding is desired, make it an explicit documented feature with audit logging."
+      },
+      {
+        "category": "Security",
+        "severity": "High",
+        "title": "Missing rate limiting and request-size limits on proxy endpoints",
+        "location": "server.py:753-949",
+        "description": "No rate limiter, no request body size cap, no per-IP concurrency cap. A single client can flood `/v1/messages` with large payloads and trigger expensive upstream calls.",
+        "impact": "Cost amplification attacks: each request costs the operator money at the upstream. Without limits, a malicious or buggy client can drain quotas, hit rate limits, or trigger runaway bills.",
+        "current_code": "@app.post(\"/v1/messages\")\nasync def create_message(request: MessagesRequest, raw_request: Request):",
+        "fixed_code": "from slowapi import Limiter\nfrom slowapi.util import get_remote_address\nfrom starlette.middleware.base import BaseHTTPMiddleware\n\nlimiter = Limiter(key_func=get_remote_address, default_limits=[\"60/minute\"])\napp.state.limiter = limiter\n\nclass MaxBodySizeMiddleware(BaseHTTPMiddleware):\n    def __init__(self, app, max_bytes: int = 10 * 1024 * 1024):\n        super().__init__(app)\n        self.max_bytes = max_bytes\n    async def dispatch(self, request, call_next):\n        cl = request.headers.get(\"content-length\")\n        if cl and int(cl) > self.max_bytes:\n            return JSONResponse({\"error\": \"payload too large\"}, status_code=413)\n        return await call_next(request)\n\napp.add_middleware(MaxBodySizeMiddleware, max_bytes=10 * 1024 * 1024)\n\n@app.post(\"/v1/messages\")\n@limiter.limit(\"60/minute\")\nasync def create_message(request: Request):",
+        "explanation": "Per-IP rate limiting and an explicit body-size cap prevent both accidental and malicious overload."
+      },
+      {
+        "category": "Security",
+        "severity": "Medium",
+        "title": "Traceback and internal model paths printed to stdout even in production",
+        "location": "server.py:73-84, 322, 882-907",
+        "description": "Logging is set to WARNING but `traceback.format_exc()` and full exception dicts are emitted at ERROR, and the `print()` in `log_request_beautifully` (line 322) bypasses the logger entirely.",
+        "impact": "Operators frequently ship stdout/stderr to third-party services. Printing unmasked URLs or model IDs can leak into systems with weaker access controls.",
+        "current_code": "logging.basicConfig(level=logging.WARNING, format=\"%(asctime)s - %(levelname)s - %(message)s\")\n...\nprint(f\"{Colors.BOLD}{method} {path}{Colors.RESET} {status}\")",
+        "fixed_code": "def log_request_beautifully(method, path, claude_model, routed_model, num_messages, num_tools, status_code):\n    status = (\"OK\" if status_code == 200 else str(status_code))\n    logger.info(\"%s %s %s claude=%s routed=%s tools=%d msgs=%d\",\n                method, path, status, claude_model, routed_model, num_tools, num_messages)",
+        "explanation": "Replacing `print()` with `logger.info()` routes output through the standard logging pipeline where operators can configure handlers, redaction, and sampling."
+      },
+      {
+        "category": "Security",
+        "severity": "Medium",
+        "title": "Config file loaded without validation; trusts arbitrary JSON structure",
+        "location": "server.py:28-46",
+        "description": "`_load_config` opens and `json.load`s the file. Malformed config (wrong types, missing fields) is accepted silently. Downstream code uses `.get()` chains that silently swallow errors, returning `None` or empty strings, leading to requests leaking with empty credentials.",
+        "impact": "Silent misconfiguration is a security issue: it bypasses the assumption that `api_key` is present and authenticated.",
+        "current_code": "def _load_config() -> dict:\n    try:\n        with open(CONFIG_PATH) as f:\n            return json.load(f)\n    except FileNotFoundError:\n        return {}\n\nCONFIG = _load_config()",
+        "fixed_code": "from pydantic import BaseModel, Field, ValidationError\n\nclass ProviderCfg(BaseModel):\n    api_key: Optional[str] = None\n    base_url: Optional[str] = None\n    # ...\n\nclass Config(BaseModel):\n    preferred_provider: Literal[\"openai\", \"anthropic\", \"google\", \"azure\", \"vertex\", \"custom_1\", \"custom_2\", \"custom_3\"]\n    big_model: str\n    small_model: str\n    openai_models: List[str] = Field(default_factory=list)\n    providers: Dict[str, ProviderCfg]\n\ndef _load_config() -> Config:\n    try:\n        with open(CONFIG_PATH) as f:\n            data = json.load(f)\n    except FileNotFoundError as e:\n        raise SystemExit(f\"config not found: {CONFIG_PATH}\") from e\n    return Config.model_validate(data)",
+        "explanation": "Pydantic validation surfaces every misconfiguration at startup with a precise error message."
+      }
+    ],
+    "Performance": [
+      {
+        "category": "Performance",
+        "severity": "High",
+        "title": "Per-request OpenAI content simplification does double-iteration and is O(n^2) on message count",
+        "location": "server.py:816-856",
+        "description": "For every request, the code iterates over messages, then for each message iterates over content blocks, then over each tool-result sub-block. Multiple `isinstance(...)` re-checks re-walk the same data structure.",
+        "impact": "Latency overhead per request, especially for tool-heavy Claude Code sessions.",
+        "current_code": "for i, msg in enumerate(litellm_req[\"messages\"]):\n    if \"content\" in msg and isinstance(msg[\"content\"], list):\n        text_content = \"\"\n        for block in msg[\"content\"]:\n            ...\n        litellm_req[\"messages\"][i][\"content\"] = text_content.strip() or \"...\"",
+        "fixed_code": "_OPENAI_SENTINEL_KEYS = frozenset({\"role\", \"content\", \"name\", \"tool_call_id\", \"tool_calls\"})\n\ndef _simplify_for_openai(messages: List[dict]) -> List[dict]:\n    out = []\n    for msg in messages:\n        content = msg.get(\"content\")\n        if isinstance(content, list):\n            parts = []\n            for block in content:\n                t = block.get(\"type\") if isinstance(block, dict) else None\n                if t == \"text\":\n                    parts.append(block.get(\"text\", \"\"))\n                elif t == \"tool_result\":\n                    parts.append(_flatten_tool_result_content(block.get(\"content\")))\n                # ...\n            out.append({\"role\": msg[\"role\"], \"content\": \"\\n\".join(parts).strip() or \"...\"})\n        else:\n            out.append({k: v for k, v in msg.items() if k in _OPENAI_SENTINEL_KEYS})\n    return out",
+        "explanation": "Single-pass construction avoids the multiple reassignments and dead-branch checks."
+      },
+      {
+        "category": "Performance",
+        "severity": "Medium",
+        "title": "No HTTP client reuse — every non-streaming request creates a new client",
+        "location": "server.py:876",
+        "description": "When using a custom `base_url`, `litellm.completion` creates an HTTP client per call. LiteLLM does some pooling but not always. For high-QPS deployments this manifests as TCP/TLS handshake overhead.",
+        "impact": "Higher latency and resource use under load. Connection pooling reduces per-request time by 50-200ms for TLS-heavy upstreams.",
+        "current_code": "litellm_response = litellm.completion(**litellm_req)",
+        "fixed_code": "import httpx\nhttp_client = httpx.AsyncClient(timeout=60.0, limits=httpx.Limits(max_keepalive_connections=20))\nlitellm_req[\"client\"] = http_client\nlitellm.drop_params = True\nlitellm.request_timeout = 60",
+        "explanation": "Passing a shared `httpx.AsyncClient` to LiteLLM reuses TCP/TLS connections."
+      },
+      {
+        "category": "Performance",
+        "severity": "Low",
+        "title": "Frozenset construction of large model lists happens at import time",
+        "location": "server.py:42-46",
+        "description": "`OPENAI_MODELS = frozenset(CONFIG.get(\"openai_models\", [])) or {...hardcoded...}` constructs a frozenset from config and falls back to a hardcoded set. The fallback is re-frozen on every import.",
+        "impact": "Minor: import-time cost. Functionally correct.",
+        "current_code": "OPENAI_MODELS = frozenset(CONFIG.get(\"openai_models\", [])) or {\"o3-mini\", \"o1\", ...}",
+        "fixed_code": "DEFAULT_OPENAI_MODELS = frozenset({\"o3-mini\", \"o1\", ...})\nOPENAI_MODELS = frozenset(CONFIG.get(\"openai_models\")) or DEFAULT_OPENAI_MODELS",
+        "explanation": "Hoist the default to module level so the fallback frozenset is built once."
+      },
+      {
+        "category": "Performance",
+        "severity": "Low",
+        "title": "JSON serialization in streaming loop builds event strings with f-strings — no batching",
+        "location": "server.py:633-748",
+        "description": "Each SSE event is individually constructed as an f-string and yielded. For high-throughput streams, this means many small yields to the ASGI layer.",
+        "impact": "Marginal throughput improvement for very long streams. Not a priority.",
+        "current_code": "yield f\"event: content_block_delta\\ndata: {json.dumps({...})}\\n\\n\"",
+        "fixed_code": "def _sse(event: str, data: dict) -> bytes:\n    return f\"event: {event}\\ndata: {json.dumps(data, separators=(',', ':'))}\\n\\n\".encode()\n\n# Buffer multiple events per yield:\nbuf = io.BytesIO()\nfor delta in chunk_deltas:\n    buf.write(_sse(\"content_block_delta\", {...}))\nif buf.tell() > 0:\n    yield buf.getvalue()",
+        "explanation": "Buffering reduces ASGI send calls. Use bytes yields and tight JSON separators."
+      }
+    ],
+    "Code Quality": [
+      {
+        "category": "Code Quality",
+        "severity": "Medium",
+        "title": "Single 961-line file mixes routing, conversion, streaming, logging, and config",
+        "location": "server.py:1-961",
+        "description": "Config loading, model-name mapping, Pydantic models, request/response conversion, SSE streaming, HTTP routes, error formatting — all in one file.",
+        "impact": "Hard to navigate, hard to test in isolation, large diffs on every change.",
+        "current_code": "# Everything in server.py",
+        "fixed_code": "server.py          # only FastAPI app + routes (~100 lines)\nconfig.py          # CONFIG loading + Pydantic config models\nmodels.py          # Anthropic-format Pydantic models\nconverters.py      # convert_anthropic_to_litellm, convert_litellm_to_anthropic\nstreaming.py       # handle_streaming + SSE event helpers\nrouting.py         # _map_model_name, _is_*_model helpers\nlogging_setup.py   # MessageFilter, Colors, log_request_beautifully",
+        "explanation": "Module boundaries align with the existing comment dividers in the file."
+      },
+      {
+        "category": "Code Quality",
+        "severity": "Medium",
+        "title": "`handle_streaming` function is 120+ lines with deeply nested conditionals",
+        "location": "server.py:628-748",
+        "description": "The function has 5+ levels of nesting, mutates 6+ state variables, and has three near-duplicate `content_block_stop` emission patterns. Cyclomatic complexity is high.",
+        "impact": "Bugs in streaming code are extremely hard to diagnose because they only manifest for specific interleavings of text and tool-call deltas.",
+        "current_code": "async def handle_streaming(response_generator, original_request: MessagesRequest):\n    try:\n        ... 120 lines, 5 nesting levels ...",
+        "fixed_code": "@dataclass\nclass StreamState:\n    text_block_index: int = 0\n    open_text_block: bool = False\n    tool_blocks: Dict[int, int] = field(default_factory=dict)\n    next_tool_index: int = 1\n    output_tokens: int = 0\n    stop_emitted: bool = False\n\nasync def _emit_event(event: str, data: dict) -> str: ...\nasync def _open_text_block(state): ...\nasync def _close_text_block(state): ...\nasync def _open_tool_block(state, ...): ...\nasync def _close_tool_block(state, ...): ...\n\nasync def handle_streaming(response_generator, request):\n    state = StreamState()\n    yield await _emit_message_start(request)\n    ...\n    async for chunk in response_generator:\n        await _apply_chunk(chunk, state)\n        async for ev in state.pending_events():\n            yield ev",
+        "explanation": "Decomposing the function into a state object + small emitters makes each piece testable and the streaming protocol invariants explicit."
+      },
+      {
+        "category": "Code Quality",
+        "severity": "Medium",
+        "title": "Pydantic v1-style validators used with Pydantic v2",
+        "location": "server.py:259-266, 278-285",
+        "description": "Mixing v1 `validator` patterns with v2 semantics. The `info.data` mutation pattern is broken in v2.",
+        "impact": "Migration debt. Future maintainers will write more broken v1-style code following the existing pattern.",
+        "current_code": "@field_validator(\"model\")\ndef validate_model_field(cls, v, info):\n    original = v\n    mapped = _map_model_name(v)\n    info.data[\"original_model\"] = original\n    return mapped",
+        "fixed_code": "@model_validator(mode=\"before\")\n@classmethod\ndef _map_model_before(cls, data):\n    if isinstance(data, dict) and \"model\" in data:\n        data = dict(data)\n        data[\"original_model\"] = data[\"model\"]\n        data[\"model\"] = _map_model_name(data[\"model\"])\n    return data",
+        "explanation": "Use the v2-native `model_validator(mode=\"before\")` for input transformation."
+      },
+      {
+        "category": "Code Quality",
+        "severity": "Medium",
+        "title": "Duplicated dict-vs-attribute access patterns throughout converters",
+        "location": "server.py:519-625, 645-732",
+        "description": "Code repeatedly does `if isinstance(x, dict): x.get(\"foo\") else getattr(x, \"foo\", default)`. Repeated 10+ times.",
+        "impact": "Maintenance burden. Easy to introduce subtle bugs (e.g., one path uses `getattr` with default `0`, another with `None`).",
+        "current_code": "func = tool_call.get(\"function\", {}) if isinstance(tool_call, dict) else getattr(tool_call, \"function\", None)",
+        "fixed_code": "def _maybe(obj, key: str, default=None):\n    if isinstance(obj, dict):\n        return obj.get(key, default)\n    return getattr(obj, key, default)\n\ndef _func_args(tc) -> dict:\n    func = _maybe(tc, \"function\", {})\n    args = _maybe(func, \"arguments\", \"{}\")\n    if isinstance(args, str):\n        try:\n            return json.loads(args)\n        except json.JSONDecodeError:\n            return {\"raw\": args}\n    return args or {}",
+        "explanation": "Two tiny helpers collapse the duplication and centralize the JSON-parse-on-string handling."
+      },
+      {
+        "category": "Code Quality",
+        "severity": "Low",
+        "title": "Bare `except:` clauses in parse_tool_result_content and convert_litellm_to_anthropic",
+        "location": "server.py:371, 587-588, 902-903",
+        "description": "Three uses of bare `except:` (catches BaseException including KeyboardInterrupt and SystemExit). Should be `except Exception`.",
+        "impact": "Hides real bugs and makes Ctrl-C unreliable. PEP 8 explicitly recommends `except Exception`.",
+        "current_code": "except:\n    return str(content)",
+        "fixed_code": "except Exception:\n    return str(content)",
+        "explanation": "Replace bare except with `except Exception` to follow PEP 8."
+      },
+      {
+        "category": "Code Quality",
+        "severity": "Low",
+        "title": "`import traceback` duplicated in the exception handler",
+        "location": "server.py:20, 883",
+        "description": "`traceback` is imported at module top and re-imported inside the function.",
+        "impact": "Cosmetic but signals carelessness.",
+        "current_code": "import traceback\n...\nexcept Exception as e:\n    import traceback",
+        "fixed_code": "except Exception as e:\n    error_details = {\"error\": str(e), ...}",
+        "explanation": "Remove the redundant inner import."
+      }
+    ],
+    "Best Practices": [
+      {
+        "category": "Best Practices",
+        "severity": "Medium",
+        "title": "No structured logging, request IDs not propagated, no correlation across logs",
+        "location": "server.py:73-84, 322, 731, 745, 877, 905, 945, 948",
+        "description": "Logs are plain string messages without structured fields, request IDs, or upstream latency breakdowns.",
+        "impact": "Hard to operate. A single failed request generates 3-5 log lines but they can't be tied together.",
+        "current_code": "logger.debug(f\"PROCESSING: Model={request.model}, Stream={request.stream}\")",
+        "fixed_code": "import structlog\nlog = structlog.get_logger()\n\nrequest_id = raw_request.headers.get(\"x-request-id\") or f\"req_{uuid.uuid4().hex[:12]}\"\nlog = log.bind(request_id=request_id, model=request.model, stream=request.stream)\nlog.info(\"processing\")",
+        "explanation": "Structured logging with a bound request_id lets operators grep one ID across client logs, proxy logs, and upstream traces."
+      },
+      {
+        "category": "Best Practices",
+        "severity": "Medium",
+        "title": "No OpenTelemetry / Prometheus metrics for upstream latency, error rate, token usage",
+        "location": "server.py:753-949",
+        "description": "The proxy has no metrics. Operators can't see request rate, p50/p99 latency per provider, error rate, or token consumption without parsing logs.",
+        "impact": "Can't alert on cost spikes, can't see which provider is slow, can't capacity-plan.",
+        "current_code": "# (no metrics)\nlitellm_response = litellm.completion(**litellm_req)",
+        "fixed_code": "from prometheus_client import Counter, Histogram, generate_latest\n\nREQ_COUNT = Counter(\"proxy_requests_total\", \"Requests\", [\"provider\", \"model\", \"status\"])\nLATENCY = Histogram(\"proxy_request_duration_seconds\", \"Request duration\", [\"provider\", \"model\"])\nTOKENS = Counter(\"proxy_tokens_total\", \"Tokens consumed\", [\"provider\", \"model\", \"direction\"])\n\n@app.middleware(\"http\")\nasync def metrics_middleware(request, call_next):\n    start = time.time()\n    response = await call_next(request)\n    LATENCY.labels(provider=PREFERRED_PROVIDER, model=\"unknown\").observe(time.time() - start)\n    REQ_COUNT.labels(provider=PREFERRED_PROVIDER, model=\"unknown\", status=response.status_code).inc()\n    return response\n\n@app.get(\"/metrics\")\nasync def metrics():\n    return Response(generate_latest(), media_type=\"text/plain\")",
+        "explanation": "A minimal Prometheus exposition gives operators the visibility they need."
+      },
+      {
+        "category": "Best Practices",
+        "severity": "Medium",
+        "title": "Hardcoded host `0.0.0.0` and port `8082` ignore environment configuration",
+        "location": "server.py:961",
+        "description": "`uvicorn.run(app, host=\"0.0.0.0\", port=8082, log_level=\"error\")` ignores `HOST` and `PORT` environment variables.",
+        "impact": "Container deployments often need to bind to a specific port from env. The current code requires patching the file.",
+        "current_code": "uvicorn.run(app, host=\"0.0.0.0\", port=8082, log_level=\"error\")",
+        "fixed_code": "HOST = os.environ.get(\"HOST\", \"0.0.0.0\")\nPORT = int(os.environ.get(\"PORT\", \"8082\"))\nLOG_LEVEL = os.environ.get(\"LOG_LEVEL\", \"error\")\n\nif __name__ == \"__main__\":\n    uvicorn.run(app, host=HOST, port=PORT, log_level=LOG_LEVEL)",
+        "explanation": "Reads env vars consistent with `CONFIG_PATH`. Standard 12-factor pattern."
+      },
+      {
+        "category": "Best Practices",
+        "severity": "Low",
+        "title": "Missing type hints on internal helpers",
+        "location": "server.py:332-373, 519-625, 628-748",
+        "description": "Functions like `parse_tool_result_content`, `clean_gemini_schema`, `convert_litellm_to_anthropic`, `handle_streaming` use `Any` heavily. Better typing (TypedDict, dataclasses) would document the expected shape.",
+        "impact": "Reduced IDE autocomplete, more bugs from wrong types slipping through.",
+        "current_code": "def parse_tool_result_content(content):\n    ...",
+        "fixed_code": "from typing import TypedDict\n\nclass ToolResultContent(TypedDict, total=False):\n    type: str\n    text: str\n\ndef parse_tool_result_content(content: Union[str, list, dict, None]) -> str:\n    ...",
+        "explanation": "TypedDict gives structural typing for internal dicts, helping mypy catch shape errors."
+      },
+      {
+        "category": "Best Practices",
+        "severity": "Low",
+        "title": "No CORS configuration — explicit opt-out would be clearer",
+        "location": "server.py:88",
+        "description": "FastAPI has no CORS middleware configured. By default it returns no `Access-Control-Allow-Origin`, so browser clients can't reach it.",
+        "impact": "Surprise for browser-based clients. Operators may add ad-hoc CORS middleware, breaking in subtle ways.",
+        "current_code": "app = FastAPI()",
+        "fixed_code": "from fastapi.middleware.cors import CORSMiddleware\n\nALLOWED_ORIGINS = os.environ.get(\"ALLOWED_ORIGINS\", \"\").split(\",\")\nif ALLOWED_ORIGINS:\n    app.add_middleware(\n        CORSMiddleware,\n        allow_origins=ALLOWED_ORIGINS,\n        allow_methods=[\"POST\", \"GET\"],\n        allow_headers=[\"x-api-key\", \"authorization\", \"content-type\", \"anthropic-version\"],\n    )",
+        "explanation": "Explicit env-driven CORS configuration. Default-off to preserve security; operators opt in deliberately."
+      }
+    ],
+    "Bugs": [
+      {
+        "category": "Bugs",
+        "severity": "High",
+        "title": "`info.data` used in Pydantic validator — unsupported API that silently drops `original_model`",
+        "location": "server.py:259-266, 278-285",
+        "description": "Pydantic v2 does not provide a writable `info.data` during field validation in the way the code assumes. Mutating `info.data[\"original_model\"]` from a `@field_validator(\"model\")` typically raises `ValueError` or silently does nothing.",
+        "impact": "The `original_model` field is populated based on the validator's mutation. If the mutation is a no-op, `original_model` is always `None`, and `count_tokens` and `create_message` will misreport and misroute the model name.",
+        "current_code": "@field_validator(\"model\")\ndef validate_model_field(cls, v, info):\n    original = v\n    mapped = _map_model_name(v)\n    info.data[\"original_model\"] = original\n    return mapped",
+        "fixed_code": "@model_validator(mode=\"before\")\n@classmethod\ndef map_model(cls, data):\n    if isinstance(data, dict) and \"model\" in data:\n        data = dict(data)\n        data[\"original_model\"] = data[\"model\"]\n        data[\"model\"] = _map_model_name(data[\"model\"])\n    return data",
+        "explanation": "Pydantic v2 forbids mutating other fields from a per-field validator. The supported pattern is `model_validator(mode=\"before\")`."
+      },
+      {
+        "category": "Bugs",
+        "severity": "High",
+        "title": "Streaming generator doesn't handle client disconnect or upstream cancellation",
+        "location": "server.py:628-748",
+        "description": "`handle_streaming` is an async generator. If the client disconnects mid-stream, the underlying `response_generator` from `litellm.acompletion` is never cancelled — the upstream HTTP request keeps running until the upstream closes or times out.",
+        "impact": "Resource leak on every client disconnect — wastes upstream tokens (paid) and holds sockets open. On flaky networks, the client sees a malformed stream because open content blocks are never closed.",
+        "current_code": "async def handle_streaming(response_generator, original_request: MessagesRequest):\n    try:\n        ...\n        async for chunk in response_generator:\n            try:\n                ...\n            except Exception as e:\n                logger.error(f\"Error processing chunk: {str(e)}\")\n                continue",
+        "fixed_code": "async def handle_streaming(response_generator, original_request: MessagesRequest):\n    message_id = f\"msg_{uuid.uuid4().hex[:24]}\"\n    text_block_closed = False\n    ...\n    try:\n        # preamble events\n        ...\n        async for chunk in response_generator:\n            ...\n    except asyncio.CancelledError:\n        logger.info(\"client disconnected, cancelling upstream stream\")\n        gen = response_generator\n        if hasattr(gen, \"aclose\"):\n            await gen.aclose()\n        raise\n    except Exception as e:\n        logger.error(\"streaming error: %s\", e, exc_info=True)\n        # Close any open blocks before signalling error\n        if not text_block_closed:\n            yield \"event: content_block_stop\\n...\\n\\n\"\n        yield f\"event: message_delta\\n...\\n\\n\"\n        yield \"event: message_stop\\n...\\n\\n\"\n        yield \"data: [DONE]\\n\\n\"\n    finally:\n        gen = response_generator\n        if hasattr(gen, \"aclose\"):\n            try:\n                await gen.aclose()\n            except Exception:\n                pass",
+        "explanation": "Honoring CancelledError and explicitly calling aclose() on the upstream generator ensures sockets and asyncio tasks are released."
+      },
+      {
+        "category": "Bugs",
+        "severity": "High",
+        "title": "Streaming response can yield `message_stop` twice",
+        "location": "server.py:712-728, 734-742",
+        "description": "The terminal branch at line 712 emits `message_stop` and `[DONE]` then `return`s. The post-loop fallback at line 734 also emits `message_stop` and `[DONE]`. If an upstream `finish_reason` arrived but a chunk exception suppressed the terminal path, the post-loop block re-emits a second `message_stop`.",
+        "impact": "Subtle streaming protocol violation that breaks some SSE consumers. Hard to reproduce but visible in production logs.",
+        "current_code": "if finish_reason and not has_sent_stop_reason:\n    has_sent_stop_reason = True\n    ...\n    yield \"data: [DONE]\\n\\n\"\n    return\n\nif not has_sent_stop_reason:\n    ...\n    yield \"data: [DONE]\\n\\n\"",
+        "fixed_code": "# Hoist the terminal emission into a helper, and only emit message_stop once.\nasync def _emit_terminal(stop_reason, output_tokens, tool_indices, text_closed):\n    if not text_closed:\n        yield \"event: content_block_stop\\n...\\n\\n\"\n    for i in tool_indices:\n        yield f\"event: content_block_stop\\n...\\n\\n\"\n    yield f\"event: message_delta\\n...\\n\\n\"\n    yield \"event: message_stop\\n...\\n\\n\"\n    yield \"data: [DONE]\\n\\n\"\n\n# In main loop, set has_sent_stop_reason immediately on first terminal emission.\n# In the post-loop fallback, check has_sent_stop_reason and skip if already set.",
+        "explanation": "Centralizing the terminal SSE events into a helper and gating the post-loop fallback eliminates the duplicate-stop and malformed-stream cases."
+      },
+      {
+        "category": "Bugs",
+        "severity": "High",
+        "title": "Synchronous `litellm.completion()` called inside an async endpoint blocks the event loop",
+        "location": "server.py:876",
+        "description": "`create_message` is declared `async def` but the non-streaming path calls `litellm.completion(**litellm_req)` synchronously. This blocks the asyncio event loop for the entire duration of the upstream call.",
+        "impact": "Production-grade async proxies must use `litellm.acompletion` everywhere. The current code works for one slow request at a time but degrades catastrophically under concurrent load.",
+        "current_code": "litellm_response = litellm.completion(**litellm_req)",
+        "fixed_code": "litellm_response = await litellm.acompletion(**litellm_req)",
+        "explanation": "`litellm.acompletion` is the async equivalent and releases the event loop while waiting on the upstream."
+      },
+      {
+        "category": "Bugs",
+        "severity": "Medium",
+        "title": "`isinstance(content, list)` check on line 853 always False because content was just set to str",
+        "location": "server.py:847-856",
+        "description": "After `text_content.strip() or \"...\"` is assigned back to `msg[\"content\"]`, the code checks `if isinstance(msg.get(\"content\"), list)` — but the previous line just assigned a string. The condition is always False.",
+        "impact": "Dead code — confusing to maintainers and indicates the intent was different from what was implemented.",
+        "current_code": "litellm_req[\"messages\"][i][\"content\"] = text_content.strip() or \"...\"\n\nif isinstance(msg.get(\"content\"), list):\n    litellm_req[\"messages\"][i][\"content\"] = f\"Content as JSON: {json.dumps(msg.get('content'))}\"\nelif msg.get(\"content\") is None:\n    litellm_req[\"messages\"][i][\"content\"] = \"...\"",
+        "fixed_code": "litellm_req[\"messages\"][i][\"content\"] = text_content.strip() or \"...\"\n\n# Optional safety net:\nif msg.get(\"content\") is None:\n    litellm_req[\"messages\"][i][\"content\"] = \"...\"",
+        "explanation": "Removing the dead branches clarifies the actual behavior."
+      },
+      {
+        "category": "Bugs",
+        "severity": "Medium",
+        "title": "`convert_anthropic_to_litellm` may emit unsupported params for non-Anthropic models",
+        "location": "server.py:467-468, 794-801",
+        "description": "`system_content` is added unconditionally. Some non-Anthropic providers don't accept a top-level `system` key. `drop_params=True` is not set for the OpenAI route at line 794-801.",
+        "impact": "Intermittent upstream 400s for OpenAI/Google routes when the Anthropic request includes a system prompt.",
+        "current_code": "if system_content:\n    litellm_req[\"system\"] = system_content",
+        "fixed_code": "if system_content:\n    litellm_req[\"system\"] = system_content\nlitellm_req.setdefault(\"drop_params\", True)",
+        "explanation": "Setting `drop_params=True` unconditionally tells LiteLLM to drop unsupported params instead of erroring."
+      },
+      {
+        "category": "Bugs",
+        "severity": "Medium",
+        "title": "Fallback `token_counter` import error returns a fixed value of 1000",
+        "location": "server.py:944-946",
+        "description": "If `token_counter` is not importable, the function returns `TokenCountResponse(input_tokens=1000)` silently. Claude Code may make token-counting decisions based on this arbitrary number.",
+        "impact": "Silent incorrect behavior. Better to raise or return None and let the caller decide.",
+        "current_code": "except ImportError:\n    return TokenCountResponse(input_tokens=1000)",
+        "fixed_code": "except ImportError:\n    raise HTTPException(status_code=503, detail=\"token counting unavailable\")",
+        "explanation": "Fail loud rather than silently returning a wrong number."
+      },
+      {
+        "category": "Bugs",
+        "severity": "Medium",
+        "title": "Content simplification for OpenAI strips images entirely (vision regression)",
+        "location": "server.py:844-845",
+        "description": "When the routing target is OpenAI/Gemini and the inbound request includes an image content block, the simplification loop replaces the block with the literal string `\"[Image content]\"`. OpenAI can natively accept image content.",
+        "impact": "Any Claude Code workflow that includes images silently loses vision capability when routed through OpenAI.",
+        "current_code": "elif block.get(\"type\") == \"image\":\n    text_content += \"[Image content]\\n\"",
+        "fixed_code": "# Pass through base64 images as image_url content parts:\nif isinstance(block.get(\"source\"), dict) and block[\"source\"].get(\"type\") == \"base64\":\n    media_type = block[\"source\"].get(\"media_type\", \"image/png\")\n    data = block[\"source\"].get(\"data\", \"\")\n    msg[\"content\"] = msg.get(\"content\")  # keep as list\n    # emit structured image_url content\ntext_content += \"[Image content]\\n\"  # only as last resort",
+        "explanation": "Multimodal content should be passed through to providers that support it."
+      }
+    ]
+  },
+  "summary": {
+    "total": 30,
+    "critical": 2,
+    "high": 7,
+    "medium": 14,
+    "low": 7,
+    "by_category": {
+      "Security": 7,
+      "Performance": 4,
+      "Code Quality": 6,
+      "Best Practices": 5,
+      "Bugs": 8
+    }
+  },
+  "strengths": [
+    "Model-name mapping is flexible and handles Anthropic/OpenAI/Gemini/Azure/Vertex/custom providers with a clean prefix-based abstraction",
+    "Streaming output produces well-formed Anthropic SSE events with correct content_block indices and tool_use handling",
+    "Pydantic models mirror the Anthropic API surface accurately (ContentBlockText, ContentBlockImage, ContentBlockToolUse, ContentBlockToolResult)",
+    "Logging filter (MessageFilter) actively suppresses noisy LiteLLM internal logs without losing genuine warnings/errors",
+    "Color-coded request logging is helpful for local development and easy to disable",
+    "Tool result content normalization handles string/list/dict inputs uniformly via parse_tool_result_content",
+    "Custom base_url support enables BYO OpenAI-compatible endpoint without forking",
+    "Streaming entry point correctly emits message_start, content_block_start, and ping events per Anthropic spec"
+  ],
+  "quick_wins": [
+    {"title": "Replace sync litellm.completion with litellm.acompletion in non-streaming path", "severity": "High", "location": "server.py:876"},
+    {"title": "Add PROXY_API_KEY auth via FastAPI Depends", "severity": "Critical", "location": "server.py:753"},
+    {"title": "Remove client-key fallback for Anthropic upstream", "severity": "High", "location": "server.py:803-808"},
+    {"title": "Sanitize exception objects before logging (deny-list api_key/authorization)", "severity": "Critical", "location": "server.py:882-907"},
+    {"title": "Replace info.data mutation with model_validator(mode='before')", "severity": "High", "location": "server.py:259-266, 278-285"},
+    {"title": "Add CancelledError handler + aclose() in handle_streaming", "severity": "High", "location": "server.py:628-748"},
+    {"title": "Add SSRF deny-list validation for base_url", "severity": "High", "location": "server.py:773-798"},
+    {"title": "Remove dead isinstance(list) branch in OpenAI content simplification", "severity": "Medium", "location": "server.py:847-856"},
+    {"title": "Set drop_params=True for all routes", "severity": "Medium", "location": "server.py:794-801"},
+    {"title": "Replace print() in log_request_beautifully with logger.info", "severity": "Medium", "location": "server.py:322"},
+    {"title": "Replace bare except: with except Exception:", "severity": "Low", "location": "server.py:371, 587-588, 902-903"},
+    {"title": "Remove redundant inner 'import traceback'", "severity": "Low", "location": "server.py:883"}
+  ],
+  "refactoring_opportunities": [
+    "Split server.py (961 lines) into config.py, models.py, converters.py, streaming.py, routing.py, logging_setup.py",
+    "Decompose handle_streaming (120+ lines, 5 nesting levels) into a StreamState dataclass + small emitters (_open_text_block, _close_text_block, _open_tool_block, _close_tool_block)",
+    "Introduce _maybe() and _func_args() helpers to eliminate the 10+ duplicated isinstance-dict/getattr access patterns",
+    "Migrate remaining v1-style @field_validator patterns to v2-native @model_validator(mode='before') for input transformation",
+    "Wrap the OpenAI content simplification in a single-pass helper _simplify_for_openai() and remove dead branches",
+    "Hoist DEFAULT_OPENAI_MODELS frozenset to module level",
+    "Use TypedDict for internal helper signatures (parse_tool_result_content, clean_gemini_schema)",
+    "Add a shared httpx.AsyncClient for connection reuse"
+  ]
+}
