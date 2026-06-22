@@ -22,7 +22,7 @@ import litellm
 from litellm import token_counter
 import uvicorn
 
-# ─── Configuration ────────────────────────────────────────────────────────────
+# --- Configuration ------------------------------------------------------------
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "config.json")
 
 def _load_config() -> dict:
@@ -33,6 +33,10 @@ def _load_config() -> dict:
         return {}
 
 CONFIG = _load_config()
+PROVIDERS_CFG = CONFIG.get("providers", {})
+PREFERRED_PROVIDER = CONFIG.get("preferred_provider", "openai").lower()
+BIG_MODEL = CONFIG.get("big_model", "gpt-4.1")
+SMALL_MODEL = CONFIG.get("small_model", "gpt-4.1-mini")
 
 PROVIDERS_CFG      = CONFIG.get("providers", {})
 PREFERRED_PROVIDER = CONFIG.get("preferred_provider", "openai").lower()
@@ -45,7 +49,7 @@ OPENAI_MODELS = frozenset(CONFIG.get("openai_models", [])) or {"o3-mini", "o1", 
 GEMINI_MODELS = frozenset(CONFIG.get("gemini_models", [])) or {"gemini-2.5-flash", "gemini-2.5-pro",
     "gemini-3.1-pro", "gemini-3.5-pro", "gemini-3.5-flash", "gemini-3-flash", "gemini-3.1-flash-lite"}
 
-# ─── Provider Helpers ──────────────────────────────────────────────────────────
+# --- Provider Helpers ----------------------------------------------------------
 
 def _provider_config(name: str) -> dict:
     """Return the provider dict from config, or empty dict if not set."""
@@ -61,14 +65,14 @@ def _is_openai_compatible() -> bool:
     """True if the active provider uses openai-compatible routing (no prefix, base_url)."""
     return PREFERRED_PROVIDER in PROVIDERS_CFG and not _has_model_override()
 
-# ─── Constants ─────────────────────────────────────────────────────────────────
+# --- Constants -----------------------------------------------------------------
 
 STOP_REASON_MAP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
 BLOCKED_LOG_PHRASES = frozenset({"LiteLLM completion()", "HTTP Request:",
                                   "selected model name for cost calculation",
                                   "utils.py", "cost_calculator"})
 
-# ─── Logging Setup ────────────────────────────────────────────────────────────
+# --- Logging Setup ------------------------------------------------------------
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -83,11 +87,11 @@ class MessageFilter(logging.Filter):
 
 logging.getLogger().addFilter(MessageFilter())
 
-# ─── App ──────────────────────────────────────────────────────────────────────
+# --- App ----------------------------------------------------------------------
 
 app = FastAPI()
 
-# ─── Pydantic Models ──────────────────────────────────────────────────────────
+# --- Pydantic Models ----------------------------------------------------------
 
 class ContentBlockText(BaseModel):
     type: Literal["text"]
@@ -132,7 +136,7 @@ class ThinkingConfig(BaseModel):
     enabled: bool = True
 
 
-# ─── Model Mapping Helper ─────────────────────────────────────────────────────
+# --- Model Mapping Helper -----------------------------------------------------
 
 def _strip_prefix(model: str) -> str:
     """Remove provider prefix from model name."""
@@ -158,28 +162,28 @@ def _apply_custom_override(model: str) -> str:
 def _map_model_name(model: str) -> str:
     """
     Map Anthropic model names to provider-specific models.
-    If the active custom provider has an explicit model → route everything there.
-    Otherwise apply haiku/sonnet/opus → SMALL/BIG mapping.
+    If the active custom provider has an explicit model -> route everything there.
+    Otherwise apply haiku/sonnet/opus -> SMALL/BIG mapping.
     """
     clean = _strip_prefix(model)
 
-    # Provider with explicit model → route all to it
+    # Provider with explicit model -> route all to it
     if _has_model_override():
         return clean  # no prefix, routes via custom base URL
 
-    # Haiku → small model
+    # Haiku -> small model
     if "haiku" in clean.lower():
         if PREFERRED_PROVIDER == "google" and SMALL_MODEL:
             return f"gemini/{SMALL_MODEL}"
         return f"openai/{SMALL_MODEL}"
 
-    # Sonnet → big model
+    # Sonnet -> big model
     if "sonnet" in clean.lower():
         if PREFERRED_PROVIDER == "google" and BIG_MODEL:
             return f"gemini/{BIG_MODEL}"
         return f"openai/{BIG_MODEL}"
 
-    # Opus → big model
+    # Opus -> big model
     if "opus" in clean.lower():
         if PREFERRED_PROVIDER == "google":
             return f"gemini/{BIG_MODEL}"
@@ -261,7 +265,7 @@ class MessagesRequest(BaseModel):
         original = v
         mapped = _map_model_name(v)
         if mapped != v or v.startswith(("openai/", "gemini/", "anthropic/")):
-            logger.debug(f"MODEL MAPPING: '{original}' → '{mapped}'")
+            logger.debug(f"MODEL MAPPING: '{original}' -> '{mapped}'")
         info.data["original_model"] = original
         return mapped
 
@@ -280,7 +284,7 @@ class TokenCountRequest(BaseModel):
         original = v
         mapped = _map_model_name(v)
         if mapped != v or v.startswith(("openai/", "gemini/", "anthropic/")):
-            logger.debug(f"TOKEN COUNT MODEL MAPPING: '{original}' → '{mapped}'")
+            logger.debug(f"TOKEN COUNT MODEL MAPPING: '{original}' -> '{mapped}'")
         info.data["original_model"] = original
         return mapped
 
@@ -307,7 +311,7 @@ class MessagesResponse(BaseModel):
     usage: Usage
 
 
-# ─── Request Logging ──────────────────────────────────────────────────────────
+# --- Request Logging ----------------------------------------------------------
 
 class Colors:
     CYAN = "\033[96m"; BLUE = "\033[94m"; GREEN = "\033[92m"; YELLOW = "\033[93m"
@@ -315,19 +319,19 @@ class Colors:
 
 
 def log_request_beautifully(method, path, claude_model, routed_model, num_messages, num_tools, status_code):
-    """Log requests showing Claude → routed model mapping."""
-    status = (f"{Colors.GREEN}✓ {status_code} OK{Colors.RESET}" if status_code == 200
-              else f"{Colors.RED}✗ {status_code}{Colors.RESET}")
+    """Log requests showing Claude -> routed model mapping."""
+    status = (f"{Colors.GREEN}[{status_code} OK]{Colors.RESET}" if status_code == 200
+              else f"{Colors.RED}[{status_code} FAIL]{Colors.RESET}")
 
     print(f"{Colors.BOLD}{method} {path}{Colors.RESET} {status}")
-    print(f"{Colors.CYAN}{_strip_model(claude_model)}{Colors.RESET} → "
+    print(f"{Colors.CYAN}{_strip_model(claude_model)}{Colors.RESET} -> "
           f"{Colors.GREEN}{_strip_model(routed_model)}{Colors.RESET} "
           f"{Colors.MAGENTA}{num_tools} tools{Colors.RESET} "
           f"{Colors.BLUE}{num_messages} messages{Colors.RESET}")
     sys.stdout.flush()
 
 
-# ─── Helper Functions ──────────────────────────────────────────────────────────
+# --- Helper Functions ----------------------------------------------------------
 
 def clean_gemini_schema(schema: Any) -> Any:
     """Remove unsupported fields from JSON schema for Gemini."""
@@ -748,7 +752,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
         yield "data: [DONE]\n\n"
 
 
-# ─── Routes ────────────────────────────────────────────────────────────────────
+# --- Routes --------------------------------------------------------------------
 
 @app.post("/v1/messages")
 async def create_message(request: MessagesRequest, raw_request: Request):
@@ -775,7 +779,10 @@ async def create_message(request: MessagesRequest, raw_request: Request):
             litellm_req["api_key"] = cfg.get("api_key") or ""
             litellm_req["api_base"] = cfg["base_url"]
             litellm_req["custom_llm_provider"] = "openai"
-            litellm_req["drop_params"] = True  # strip unsupported params (e.g. thinking, top_k)
+            litellm_req["drop_params"] = True
+            # Ensure openai/ prefix so LiteLLM doesn't add another one
+            if not litellm_req["model"].startswith("openai/"):
+                litellm_req["model"] = "openai/" + litellm_req["model"]
             logger.debug(f"Using {PREFERRED_PROVIDER}: base={cfg['base_url']}, model={litellm_req['model']}")
 
         elif PREFERRED_PROVIDER == "azure":
