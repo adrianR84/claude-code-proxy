@@ -25,6 +25,8 @@ uv run uvicorn server:app --host 0.0.0.0 --port 8082 --reload
 
 ## Configure Claude Code
 
+**Configuration (API keys, providers) is done in `.env` — see examples below.**
+
 ```bash
 # Standard
 ANTHROPIC_BASE_URL=http://localhost:8082 claude
