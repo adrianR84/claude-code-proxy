@@ -17,7 +17,10 @@ cp .env.example .env
 # Edit .env with your API keys
 
 # Run
+# Without reload (production):
 uv run uvicorn server:app --host 0.0.0.0 --port 8082
+# With reload (development - auto-restarts on code changes):
+uv run uvicorn server:app --host 0.0.0.0 --port 8082 --reload
 ```
 
 ## Configure Claude Code
@@ -44,8 +47,8 @@ Every request (haiku, sonnet, opus) routes to `CUSTOM_MODEL`.
 CUSTOM_API_KEY=your-api-key
 CUSTOM_BASE_URL=https://your-endpoint.com/api/v1/gateway/v1
 PREFERRED_PROVIDER=custom
-BIG_MODEL=gpt-4.1
-SMALL_MODEL=gpt-4.1-mini
+BIG_MODEL=gpt-5.5
+SMALL_MODEL=gpt-5.4-mini
 ```
 
 Routes through custom endpoint but respects mapping: `haiku → SMALL`, `sonnet/opus → BIG`.
@@ -71,17 +74,17 @@ CUSTOM_BASE_URL=https://api.autonaisol.xyz/api/v1/gateway/v1
 
 PREFERRED_PROVIDER=openai
 OPENAI_BASE_URL=
-BIG_MODEL=gpt-4.1
-SMALL_MODEL=gpt-4.1-mini
+BIG_MODEL=gpt-5.5
+SMALL_MODEL=gpt-5.4-mini
 ```
 
 ## Model Mapping
 
 | Claude Model | Maps To |
 |--------------|---------|
-| haiku | SMALL_MODEL |
-| sonnet | BIG_MODEL |
-| opus | BIG_MODEL |
+| haiku | SMALL_MODEL (gpt-5.4-mini) |
+| sonnet | BIG_MODEL (gpt-5.5) |
+| opus | BIG_MODEL (gpt-5.5) |
 
 ## Docker
 

@@ -85,8 +85,10 @@ OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
 # ════════════════════════════════════════════════════════════════════════════════
 OPENAI_MODELS = {"o3-mini", "o1", "o1-mini", "o1-pro", "gpt-4.5-preview", "gpt-4o",
                  "gpt-4o-audio-preview", "chatgpt-4o-latest", "gpt-4o-mini",
-                 "gpt-4o-mini-audio-preview", "gpt-4.1", "gpt-4.1-mini", "gpt-5.5"}
-GEMINI_MODELS = {"gemini-2.5-flash", "gemini-2.5-pro"}
+                 "gpt-4o-mini-audio-preview", "gpt-4.1", "gpt-4.1-mini", "gpt-5.5",
+                 "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"}
+GEMINI_MODELS = {"gemini-2.5-flash", "gemini-2.5-pro", "gemini-3.1-pro", "gemini-3.5-pro",
+                 "gemini-3.5-flash", "gemini-3-flash", "gemini-3.1-flash-lite"}
 
 # ─── Constants ─────────────────────────────────────────────────────────────────
 
