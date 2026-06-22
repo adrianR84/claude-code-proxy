@@ -105,3 +105,7 @@ services:
     ports:
       - 8082:8082
 ```
+
+---
+
+Original creator: [adrianR84](https://github.com/adrianR84)
