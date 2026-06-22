@@ -108,4 +108,4 @@ services:
 
 ---
 
-Original creator: [adrianR84](https://github.com/adrianR84)
+Original creator: [1rgs](https://github.com/1rgs/claude-code-proxy)
