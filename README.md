@@ -26,7 +26,11 @@ uv run uvicorn server:app --host 0.0.0.0 --port 8082 --reload
 ## Configure Claude Code
 
 ```bash
+# Standard
 ANTHROPIC_BASE_URL=http://localhost:8082 claude
+
+# If not authorized (use placeholder token):
+ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN="sk-ant-api03-placeholder" claude
 ```
 
 ## Configuration
