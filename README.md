@@ -17,10 +17,16 @@ cp .env.example .env
 # Edit .env with your API keys
 
 # Run
-# Without reload (production):
-uv run uvicorn server:app --host 0.0.0.0 --port 8082
-# With reload (development - auto-restarts on code changes):
-uv run uvicorn server:app --host 0.0.0.0 --port 8082 --reload
+./run.sh        # dev (with --reload)
+./run.sh prod   # production
+
+# Or manually:
+uv run uvicorn server:app --host 0.0.0.0 --port 8082 --reload  # dev
+uv run uvicorn server:app --host 0.0.0.0 --port 8082            # prod
+
+# Unix users can also use:
+make run        # dev
+make run-prod   # prod
 ```
 
 ## Configure Claude Code
