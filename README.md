@@ -98,26 +98,6 @@ SMALL_MODEL=gpt-5.4-mini
 | sonnet | BIG_MODEL (gpt-5.5) |
 | opus | BIG_MODEL (gpt-5.5) |
 
-## Docker
-
-```bash
-curl -O https://raw.githubusercontent.com/adrianR84/claude-code-proxy/main/.env.example
-# Edit .env, then:
-docker run -d --env-file .env -p 8082:8082 ghcr.io/adrianR84/claude-code-proxy:latest
-```
-
-Or with compose:
-
-```yaml
-services:
-  proxy:
-    image: ghcr.io/adrianR84/claude-code-proxy:latest
-    restart: unless-stopped
-    env_file: .env
-    ports:
-      - 8082:8082
-```
-
 ---
 
 Original creator: [1rgs](https://github.com/1rgs/claude-code-proxy) — simplified by [adrianR84](https://github.com/adrianR84)
