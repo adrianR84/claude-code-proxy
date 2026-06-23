@@ -22,14 +22,19 @@ import asyncio
 import sys
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Set
-from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# Load configuration from config.json
+_config = {}
+_config_path = os.environ.get("CONFIG_PATH", "config.json")
+try:
+    with open(_config_path) as f:
+        _config = json.load(f)
+except FileNotFoundError:
+    pass
 
 # Configuration
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-PROXY_API_KEY = os.environ.get("ANTHROPIC_API_KEY")  # Using same key for proxy
+ANTHROPIC_API_KEY = _config.get("anthropic_api_key") or _config.get("anthropic_auth_token") or ""
+PROXY_API_KEY = ANTHROPIC_API_KEY  # Using same key for proxy
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 PROXY_API_URL = "http://localhost:8082/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
@@ -697,7 +702,7 @@ async def run_tests(args):
 async def main():
     # Check that API key is set
     if not ANTHROPIC_API_KEY:
-        print("Error: ANTHROPIC_API_KEY not set in .env file")
+        print("Error: ANTHROPIC_API_KEY not set in config.json")
         return
     
     # Parse command-line arguments

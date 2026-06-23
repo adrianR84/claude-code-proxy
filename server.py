@@ -2,7 +2,7 @@
 Anthropic-to-LiteLLM Proxy Server
 
 Routes Claude Code requests to custom OpenAI-compatible endpoints.
-Supports CUSTOM_MODEL override to route ALL requests to a specific model.
+Supports multiple custom providers with preferred_provider switching.
 """
 
 from fastapi import FastAPI, Request, HTTPException
@@ -21,83 +21,58 @@ import traceback
 import litellm
 from litellm import token_counter
 import uvicorn
-from dotenv import load_dotenv
 
-# ─── Configuration ────────────────────────────────────────────────────────────
-# Load environment variables from .env file
-load_dotenv()
+# --- Configuration ------------------------------------------------------------
+CONFIG_PATH = os.environ.get("CONFIG_PATH", "config.json")
 
-# ════════════════════════════════════════════════════════════════════════════════
-# PROVIDER API KEYS
-# ════════════════════════════════════════════════════════════════════════════════
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
-OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY")
-GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY")
+def _load_config() -> dict:
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
 
-# ════════════════════════════════════════════════════════════════════════════════
-# CUSTOM PROVIDER (overrides ALL requests when set)
-# ════════════════════════════════════════════════════════════════════════════════
-# Model name - routes ALL Anthropic requests to this model
-CUSTOM_MODEL         = os.environ.get("CUSTOM_MODEL")
-# Credentials and endpoint for the custom provider
-CUSTOM_API_KEY       = os.environ.get("CUSTOM_API_KEY")
-CUSTOM_BASE_URL      = os.environ.get("CUSTOM_BASE_URL")   # e.g. https://api.autonaisol.xyz/api/v1/gateway/v1
+CONFIG = _load_config()
+PROVIDERS_CFG = CONFIG.get("providers", {})
+PREFERRED_PROVIDER = CONFIG.get("preferred_provider", "openai").lower()
+BIG_MODEL = CONFIG.get("big_model", "gpt-4.1")
+SMALL_MODEL = CONFIG.get("small_model", "gpt-4.1-mini")
 
-# ════════════════════════════════════════════════════════════════════════════════
-# AZURE OPENAI (when using Azure-hosted models)
-# ════════════════════════════════════════════════════════════════════════════════
-AZURE_API_KEY    = os.environ.get("AZURE_API_KEY")
-AZURE_BASE_URL   = os.environ.get("AZURE_BASE_URL")
-AZURE_API_VERSION = os.environ.get("AZURE_API_VERSION", "2024-06-01")
+PROVIDERS_CFG      = CONFIG.get("providers", {})
+PREFERRED_PROVIDER = CONFIG.get("preferred_provider", "openai").lower()
+BIG_MODEL          = CONFIG.get("big_model", "gpt-4.1")
+SMALL_MODEL        = CONFIG.get("small_model", "gpt-4.1-mini")
 
-# ════════════════════════════════════════════════════════════════════════════════
-# VERTEX AI (Google Cloud) - for Gemini models on GCP
-# ════════════════════════════════════════════════════════════════════════════════
-VERTEX_PROJECT  = os.environ.get("VERTEX_PROJECT", "unset")
-VERTEX_LOCATION = os.environ.get("VERTEX_LOCATION", "unset")
-# Use GCP Application Default Credentials instead of API key
-USE_VERTEX_AUTH = os.environ.get("USE_VERTEX_AUTH", "False").lower() == "true"
+OPENAI_MODELS = frozenset(CONFIG.get("openai_models", [])) or {"o3-mini", "o1", "o1-mini", "o1-pro",
+    "gpt-4.5-preview", "gpt-4o", "gpt-4o-audio-preview", "chatgpt-4o-latest", "gpt-4o-mini",
+    "gpt-4o-mini-audio-preview", "gpt-4.1", "gpt-4.1-mini", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"}
+GEMINI_MODELS = frozenset(CONFIG.get("gemini_models", [])) or {"gemini-2.5-flash", "gemini-2.5-pro",
+    "gemini-3.1-pro", "gemini-3.5-pro", "gemini-3.5-flash", "gemini-3-flash", "gemini-3.1-flash-lite"}
 
-# ════════════════════════════════════════════════════════════════════════════════
-# ROUTING & MODEL MAPPING
-# ════════════════════════════════════════════════════════════════════════════════
-# Auto-detect effective provider based on configured credentials
-# Priority: CUSTOM > AZURE > VERTEX > explicit PREFERRED_PROVIDER
-def _resolve_provider() -> str:
-    if CUSTOM_API_KEY and CUSTOM_BASE_URL:
-        return "custom"
-    if AZURE_API_KEY and AZURE_BASE_URL:
-        return "azure"
-    if VERTEX_PROJECT != "unset" and USE_VERTEX_AUTH:
-        return "vertex"
-    return os.environ.get("PREFERRED_PROVIDER", "openai").lower()
+# --- Provider Helpers ----------------------------------------------------------
 
-PREFERRED_PROVIDER = _resolve_provider()
+def _provider_config(name: str) -> dict:
+    """Return the provider dict from config, or empty dict if not set."""
+    return PROVIDERS_CFG.get(name, {})
 
-# Model tier mapping for Claude model names
-BIG_MODEL   = os.environ.get("BIG_MODEL", "gpt-4.1")
-SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-4.1-mini")
-# Override OpenAI base URL (e.g. for proxies or Azure endpoints)
-OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
 
-# ════════════════════════════════════════════════════════════════════════════════
-# KNOWN MODEL LISTS
-# ════════════════════════════════════════════════════════════════════════════════
-OPENAI_MODELS = {"o3-mini", "o1", "o1-mini", "o1-pro", "gpt-4.5-preview", "gpt-4o",
-                 "gpt-4o-audio-preview", "chatgpt-4o-latest", "gpt-4o-mini",
-                 "gpt-4o-mini-audio-preview", "gpt-4.1", "gpt-4.1-mini", "gpt-5.5",
-                 "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"}
-GEMINI_MODELS = {"gemini-2.5-flash", "gemini-2.5-pro", "gemini-3.1-pro", "gemini-3.5-pro",
-                 "gemini-3.5-flash", "gemini-3-flash", "gemini-3.1-flash-lite"}
+def _has_model_override() -> bool:
+    """True if the active provider has an explicit model set (routes everything there)."""
+    return bool(_provider_config(PREFERRED_PROVIDER).get("model"))
 
-# ─── Constants ─────────────────────────────────────────────────────────────────
+
+def _is_openai_compatible() -> bool:
+    """True if the active provider uses openai-compatible routing (no prefix, base_url)."""
+    return PREFERRED_PROVIDER in PROVIDERS_CFG and not _has_model_override()
+
+# --- Constants -----------------------------------------------------------------
 
 STOP_REASON_MAP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
 BLOCKED_LOG_PHRASES = frozenset({"LiteLLM completion()", "HTTP Request:",
                                   "selected model name for cost calculation",
                                   "utils.py", "cost_calculator"})
 
-# ─── Logging Setup ────────────────────────────────────────────────────────────
+# --- Logging Setup ------------------------------------------------------------
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -112,11 +87,11 @@ class MessageFilter(logging.Filter):
 
 logging.getLogger().addFilter(MessageFilter())
 
-# ─── App ──────────────────────────────────────────────────────────────────────
+# --- App ----------------------------------------------------------------------
 
 app = FastAPI()
 
-# ─── Pydantic Models ──────────────────────────────────────────────────────────
+# --- Pydantic Models ----------------------------------------------------------
 
 class ContentBlockText(BaseModel):
     type: Literal["text"]
@@ -161,7 +136,7 @@ class ThinkingConfig(BaseModel):
     enabled: bool = True
 
 
-# ─── Model Mapping Helper ─────────────────────────────────────────────────────
+# --- Model Mapping Helper -----------------------------------------------------
 
 def _strip_prefix(model: str) -> str:
     """Remove provider prefix from model name."""
@@ -176,9 +151,20 @@ def _strip_model(model: str) -> str:
     return model.split("/")[-1] if "/" in model else model
 
 
+def _strip_tool_blocks(content: Any) -> Any:
+    """Remove tool_use/tool_result blocks from message content for custom endpoints."""
+    if not isinstance(content, list):
+        return content
+    return [
+        b for b in content
+        if not (isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result"))
+    ]
+
+
 def _apply_custom_override(model: str) -> str:
-    """Strip openai/ prefix from model when using CUSTOM_BASE_URL."""
-    if CUSTOM_BASE_URL and model.startswith("openai/"):
+    """Strip openai/ prefix from model when using a custom base URL."""
+    cfg = _provider_config(PREFERRED_PROVIDER)
+    if cfg and cfg.get("base_url") and model.startswith("openai/"):
         return model[7:]
     return model
 
@@ -186,70 +172,86 @@ def _apply_custom_override(model: str) -> str:
 def _map_model_name(model: str) -> str:
     """
     Map Anthropic model names to provider-specific models.
-    CUSTOM_MODEL overrides everything when set.
-    PREFERRED_PROVIDER determines routing (auto-detected if CUSTOM/AZURE/VERTEX vars are set).
-    Returns the provider-prefixed model name.
+    If the active custom provider has an explicit model -> route everything there.
+    Otherwise apply haiku/sonnet/opus -> SMALL/BIG mapping.
     """
     clean = _strip_prefix(model)
 
-    # CUSTOM_MODEL overrides ALL requests
-    if CUSTOM_MODEL:
-        return CUSTOM_MODEL
+    # Provider with explicit model -> route all to it
+    if _has_model_override():
+        return clean  # no prefix, routes via custom base URL
 
-    # No prefix for custom provider → routes via CUSTOM_BASE_URL
-    if PREFERRED_PROVIDER == "custom":
-        return clean
-
-    # Azure → azure/ prefix
-    if PREFERRED_PROVIDER == "azure":
-        return f"azure/{clean}"
-
-    # Vertex (GCP) → gemini/ prefix
-    if PREFERRED_PROVIDER == "vertex":
-        return f"gemini/{clean}"
-
-    # Provider-specific routing
-    if PREFERRED_PROVIDER == "anthropic":
-        return f"anthropic/{clean}"
-
-    # Haiku → small model
+    # Haiku -> small model
     if "haiku" in clean.lower():
-        if PREFERRED_PROVIDER == "google" and SMALL_MODEL in GEMINI_MODELS:
+        if PREFERRED_PROVIDER == "google" and SMALL_MODEL:
             return f"gemini/{SMALL_MODEL}"
         return f"openai/{SMALL_MODEL}"
 
-    # Sonnet → big model
+    # Sonnet -> big model
     if "sonnet" in clean.lower():
-        if PREFERRED_PROVIDER == "google" and BIG_MODEL in GEMINI_MODELS:
+        if PREFERRED_PROVIDER == "google" and BIG_MODEL:
             return f"gemini/{BIG_MODEL}"
         return f"openai/{BIG_MODEL}"
 
-    # Opus → gpt-5.5 equivalent
+    # Opus -> big model
     if "opus" in clean.lower():
         if PREFERRED_PROVIDER == "google":
             return f"gemini/{BIG_MODEL}"
-        return "openai/gpt-5.5"
+        if _is_openai_compatible():
+            return clean  # no prefix, routes via custom base URL
+        return "openai/gpt-4.1"
 
-    # Add prefix to known models that don't have one
+    # Azure
+    if PREFERRED_PROVIDER == "azure":
+        return f"azure/{clean}"
+
+    # Vertex (GCP)
+    if PREFERRED_PROVIDER == "vertex":
+        return f"gemini/{clean}"
+
+    # Anthropic direct
+    if PREFERRED_PROVIDER == "anthropic":
+        return f"anthropic/{clean}"
+
+    # Google/Gemini models
     if clean in GEMINI_MODELS and not model.startswith("gemini/"):
         return f"gemini/{clean}"
     if clean in OPENAI_MODELS and not model.startswith("openai/"):
         return f"openai/{clean}"
 
-    # Default to preferred provider
+    # Default
     if not model.startswith(("openai/", "gemini/", "anthropic/")):
         return f"{PREFERRED_PROVIDER}/{clean}"
 
     return model
 
 
-def _is_custom_model(model: str) -> bool:
-    """Check if a model should be routed to the custom provider."""
-    if CUSTOM_MODEL:
+def _is_anthropic_model(model: str) -> bool:
+    """Check if model is Anthropic (has anthropic/ prefix or is a known Claude model)."""
+    if model.startswith("anthropic/"):
         return True
-    if PREFERRED_PROVIDER == "custom":
+    stripped = _strip_prefix(model)
+    return stripped.startswith("claude-") or stripped in ("opus", "sonnet", "haiku", "claude-3-5-sonnet-20240620")
+
+
+def _is_openai_model(model: str) -> bool:
+    """Check if model should be treated as OpenAI."""
+    if model.startswith("openai/"):
         return True
-    return False
+    if model.startswith("anthropic/") or model.startswith("gemini/"):
+        return False
+    if _is_openai_compatible():
+        return False
+    stripped = _strip_prefix(model)
+    return stripped in OPENAI_MODELS or "/" in model
+
+
+def _is_gemini_model(model: str) -> bool:
+    """Check if model is Gemini (gemini/ prefix or in GEMINI_MODELS)."""
+    if model.startswith("gemini/"):
+        return True
+    stripped = _strip_prefix(model)
+    return stripped in GEMINI_MODELS
 
 
 class MessagesRequest(BaseModel):
@@ -273,7 +275,7 @@ class MessagesRequest(BaseModel):
         original = v
         mapped = _map_model_name(v)
         if mapped != v or v.startswith(("openai/", "gemini/", "anthropic/")):
-            logger.debug(f"MODEL MAPPING: '{original}' → '{mapped}'")
+            logger.debug(f"MODEL MAPPING: '{original}' -> '{mapped}'")
         info.data["original_model"] = original
         return mapped
 
@@ -292,7 +294,7 @@ class TokenCountRequest(BaseModel):
         original = v
         mapped = _map_model_name(v)
         if mapped != v or v.startswith(("openai/", "gemini/", "anthropic/")):
-            logger.debug(f"TOKEN COUNT MODEL MAPPING: '{original}' → '{mapped}'")
+            logger.debug(f"TOKEN COUNT MODEL MAPPING: '{original}' -> '{mapped}'")
         info.data["original_model"] = original
         return mapped
 
@@ -319,7 +321,7 @@ class MessagesResponse(BaseModel):
     usage: Usage
 
 
-# ─── Request Logging ──────────────────────────────────────────────────────────
+# --- Request Logging ----------------------------------------------------------
 
 class Colors:
     CYAN = "\033[96m"; BLUE = "\033[94m"; GREEN = "\033[92m"; YELLOW = "\033[93m"
@@ -327,19 +329,19 @@ class Colors:
 
 
 def log_request_beautifully(method, path, claude_model, routed_model, num_messages, num_tools, status_code):
-    """Log requests showing Claude → routed model mapping."""
-    status = (f"{Colors.GREEN}✓ {status_code} OK{Colors.RESET}" if status_code == 200
-              else f"{Colors.RED}✗ {status_code}{Colors.RESET}")
+    """Log requests showing Claude -> routed model mapping."""
+    status = (f"{Colors.GREEN}[{status_code} OK]{Colors.RESET}" if status_code == 200
+              else f"{Colors.RED}[{status_code} FAIL]{Colors.RESET}")
 
     print(f"{Colors.BOLD}{method} {path}{Colors.RESET} {status}")
-    print(f"{Colors.CYAN}{_strip_model(claude_model)}{Colors.RESET} → "
+    print(f"{Colors.CYAN}{_strip_model(claude_model)}{Colors.RESET} -> "
           f"{Colors.GREEN}{_strip_model(routed_model)}{Colors.RESET} "
           f"{Colors.MAGENTA}{num_tools} tools{Colors.RESET} "
           f"{Colors.BLUE}{num_messages} messages{Colors.RESET}")
     sys.stdout.flush()
 
 
-# ─── Helper Functions ──────────────────────────────────────────────────────────
+# --- Helper Functions ----------------------------------------------------------
 
 def clean_gemini_schema(schema: Any) -> Any:
     """Remove unsupported fields from JSON schema for Gemini."""
@@ -385,35 +387,6 @@ def parse_tool_result_content(content):
     return str(content)
 
 
-def _is_anthropic_model(model: str) -> bool:
-    """Check if model is Anthropic (has anthropic/ prefix or is a known Claude model)."""
-    if model.startswith("anthropic/"):
-        return True
-    stripped = _strip_prefix(model)
-    return stripped.startswith("claude-") or stripped in ("opus", "sonnet", "haiku", "claude-3-5-sonnet-20240620")
-
-
-def _is_openai_model(model: str) -> bool:
-    """Check if model should be treated as OpenAI (openai/ prefix or CUSTOM_MODEL without anthropic prefix)."""
-    if model.startswith("openai/"):
-        return True
-    if model.startswith("anthropic/") or model.startswith("gemini/"):
-        return False
-    if PREFERRED_PROVIDER == "custom":
-        return False
-    # CUSTOM_MODEL or other non-prefixed models default to openai-compatible
-    stripped = _strip_prefix(model)
-    return stripped in OPENAI_MODELS or "/" in model or CUSTOM_MODEL
-
-
-def _is_gemini_model(model: str) -> bool:
-    """Check if model is Gemini (gemini/ prefix or in GEMINI_MODELS)."""
-    if model.startswith("gemini/"):
-        return True
-    stripped = _strip_prefix(model)
-    return stripped in GEMINI_MODELS
-
-
 def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str, Any]:
     """Convert Anthropic API request format to LiteLLM format."""
 
@@ -437,7 +410,6 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     for msg in anthropic_request.messages:
         content = msg.content
 
-        # Extract system messages
         if msg.role == "system":
             if isinstance(content, str):
                 system_content = (system_content + "\n\n" + content) if system_content else content
@@ -449,7 +421,6 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                         system_content = (system_content + "\n\n" + block.get("text", "")) if system_content else block.get("text", "")
             continue
 
-        # Build message content
         if isinstance(content, str):
             messages.append({"role": msg.role, "content": content})
         else:
@@ -491,18 +462,10 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                         })
                 messages.append({"role": msg.role, "content": processed})
 
-    # Cap max_tokens for OpenAI/Gemini
     model = anthropic_request.model
     max_tokens = anthropic_request.max_tokens
     if _is_openai_model(model) or _is_gemini_model(model):
         max_tokens = min(max_tokens, 16384)
-
-    # Ensure model has provider prefix for LiteLLM
-    if not model.startswith(("anthropic/", "openai/", "gemini/")):
-        if CUSTOM_MODEL:
-            model = CUSTOM_MODEL
-        else:
-            model = f"anthropic/{model}"
 
     litellm_req = {
         "model": model,
@@ -515,7 +478,6 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     if system_content:
         litellm_req["system"] = system_content
 
-    # Only add thinking for Anthropic models
     if anthropic_request.thinking and _is_anthropic_model(model):
         litellm_req["thinking"] = anthropic_request.thinking
 
@@ -569,13 +531,11 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
 
 
 def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any], original_request: MessagesRequest) -> MessagesResponse:
-    """Convert LiteLLM response to Anthropic API format."""
 
     try:
         clean_model = _strip_prefix(original_request.model)
         is_claude = clean_model.startswith("claude-")
 
-        # Extract from ModelResponse object or dict
         if hasattr(litellm_response, "choices") and hasattr(litellm_response, "usage"):
             choices = litellm_response.choices
             message = choices[0].message if choices else None
@@ -600,7 +560,6 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any], o
         if content_text:
             content.append({"type": "text", "text": content_text})
 
-        # Handle tool calls
         if tool_calls and is_claude:
             if not isinstance(tool_calls, list):
                 tool_calls = [tool_calls]
@@ -647,7 +606,6 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any], o
             else:
                 content.append({"type": "text", "text": tool_text})
 
-        # Extract usage
         if isinstance(usage_info, dict):
             prompt_tokens = usage_info.get("prompt_tokens", 0)
             completion_tokens = usage_info.get("completion_tokens", 0)
@@ -655,7 +613,6 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any], o
             prompt_tokens = getattr(usage_info, "prompt_tokens", 0)
             completion_tokens = getattr(usage_info, "completion_tokens", 0)
 
-        # Map finish_reason
         stop_reason = STOP_REASON_MAP.get(finish_reason, "end_turn")
 
         if not content:
@@ -719,7 +676,6 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                             text_sent = True
                             yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': delta_content}})}\n\n"
 
-                    # Process tool calls
                     delta_tool_calls = getattr(delta, "tool_calls", None)
                     if delta_tool_calls is None and isinstance(delta, dict):
                         delta_tool_calls = delta.get("tool_calls")
@@ -789,7 +745,6 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                 logger.error(f"Error processing chunk: {str(e)}")
                 continue
 
-        # Handle case where we didn't get a finish reason
         if not has_sent_stop_reason:
             if tool_index is not None:
                 for i in range(1, last_tool_index + 1):
@@ -807,7 +762,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
         yield "data: [DONE]\n\n"
 
 
-# ─── Routes ────────────────────────────────────────────────────────────────────
+# --- Routes --------------------------------------------------------------------
 
 @app.post("/v1/messages")
 async def create_message(request: MessagesRequest, raw_request: Request):
@@ -815,58 +770,70 @@ async def create_message(request: MessagesRequest, raw_request: Request):
     try:
         client_api_key = raw_request.headers.get("x-api-key") or raw_request.headers.get("authorization", "").replace("Bearer ", "")
 
-        # Re-parse body to get original model name (Pydantic already mapped it)
-        body = await raw_request.body()
-        body_json = json.loads(body.decode("utf-8"))
-        original_model = body_json.get("model", request.model)
+        original_model = request.original_model or request.model
 
         logger.debug(f"PROCESSING: Model={request.model}, Stream={request.stream}")
 
         litellm_req = convert_anthropic_to_litellm(request)
         model_for_routing = litellm_req["model"]
 
-        # Apply CUSTOM_MODEL override - strip openai/ prefix if using custom api_base
-        if CUSTOM_MODEL:
-            litellm_req["model"] = _apply_custom_override(CUSTOM_MODEL)
-            logger.debug(f"CUSTOM_MODEL override: '{litellm_req['model']}'")
+        # Apply per-provider model override
+        cfg = _provider_config(PREFERRED_PROVIDER)
+        if cfg.get("model"):
+            litellm_req["model"] = _apply_custom_override(cfg["model"])
+            logger.debug(f"Provider model override: '{litellm_req['model']}'")
 
-        # Route based on PREFERRED_PROVIDER (auto-detected from env)
-        if PREFERRED_PROVIDER == "custom":
-            litellm_req["api_key"] = CUSTOM_API_KEY or OPENAI_API_KEY
-            if CUSTOM_BASE_URL:
-                litellm_req["api_base"] = CUSTOM_BASE_URL
+        # Route based on PREFERRED_PROVIDER
+        if cfg.get("base_url"):
+            # OpenAI-compatible provider (any named provider with a base_url)
+            litellm_req["api_key"] = cfg.get("api_key") or ""
+            litellm_req["api_base"] = cfg["base_url"]
             litellm_req["custom_llm_provider"] = "openai"
-            logger.debug(f"Using custom provider: base={CUSTOM_BASE_URL}, model={litellm_req['model']}")
+            litellm_req["drop_params"] = True
+            # jatevo doesn't support system or tool blocks
+            if "jatevo" in cfg["base_url"]:
+                litellm_req.pop("system", None)
+                litellm_req["messages"] = [
+                    {**m, "content": _strip_tool_blocks(m.get("content"))}
+                    for m in litellm_req.get("messages", [])
+                ]
+            # Ensure openai/ prefix so LiteLLM doesn't add another one
+            if not litellm_req["model"].startswith("openai/"):
+                litellm_req["model"] = "openai/" + litellm_req["model"]
+            logger.debug(f"Using {PREFERRED_PROVIDER}: base={cfg['base_url']}, model={litellm_req['model']}")
+
         elif PREFERRED_PROVIDER == "azure":
-            litellm_req["api_key"] = AZURE_API_KEY
-            litellm_req["api_base"] = AZURE_BASE_URL
-            litellm_req["api_version"] = AZURE_API_VERSION
+            litellm_req["api_key"] = cfg.get("api_key") or ""
+            litellm_req["api_base"] = cfg.get("base_url") or ""
+            litellm_req["api_version"] = cfg.get("api_version", "2024-06-01")
             litellm_req["custom_llm_provider"] = "azure"
-            logger.debug(f"Using Azure: base={AZURE_BASE_URL}, model={litellm_req['model']}")
+            logger.debug(f"Using Azure: base={cfg.get('base_url')}, model={litellm_req['model']}")
+
         elif PREFERRED_PROVIDER == "vertex":
-            litellm_req["vertex_project"] = VERTEX_PROJECT
-            litellm_req["vertex_location"] = VERTEX_LOCATION
+            litellm_req["vertex_project"] = cfg.get("project", "")
+            litellm_req["vertex_location"] = cfg.get("location", "")
             litellm_req["custom_llm_provider"] = "vertex_ai"
-            logger.debug(f"Using Vertex AI: project={VERTEX_PROJECT}, model={litellm_req['model']}")
+            logger.debug(f"Using Vertex AI: project={cfg.get('project')}, model={litellm_req['model']}")
+
         elif PREFERRED_PROVIDER == "openai":
-            if OPENAI_BASE_URL:
-                litellm_req["api_key"] = OPENAI_API_KEY
-                litellm_req["api_base"] = OPENAI_BASE_URL
-                logger.debug(f"Using OpenAI with base URL: {OPENAI_BASE_URL}")
+            if cfg.get("base_url"):
+                litellm_req["api_key"] = cfg.get("api_key") or ""
+                litellm_req["api_base"] = cfg["base_url"]
+                logger.debug(f"Using OpenAI with base URL: {cfg['base_url']}")
             else:
-                litellm_req["api_key"] = OPENAI_API_KEY
+                litellm_req["api_key"] = cfg.get("api_key") or ""
                 logger.debug(f"Using OpenAI API key: {model_for_routing}")
+
         elif PREFERRED_PROVIDER == "anthropic":
             if client_api_key:
                 litellm_req["api_key"] = client_api_key
-                os.environ["ANTHROPIC_API_KEY"] = client_api_key
-            elif ANTHROPIC_API_KEY:
-                litellm_req["api_key"] = ANTHROPIC_API_KEY
-                os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
+            elif cfg.get("api_key"):
+                litellm_req["api_key"] = cfg["api_key"]
             logger.debug(f"Using Anthropic API key: {model_for_routing}")
+
         else:
             # google / gemini
-            litellm_req["api_key"] = GEMINI_API_KEY
+            litellm_req["api_key"] = cfg.get("api_key") or ""
             logger.debug(f"Using Gemini API key: {model_for_routing}")
 
         # Simplify content for OpenAI models
@@ -903,12 +870,10 @@ async def create_message(request: MessagesRequest, raw_request: Request):
 
                     litellm_req["messages"][i]["content"] = text_content.strip() or "..."
 
-                # Remove unsupported fields
                 for key in list(msg.keys()):
                     if key not in ("role", "content", "name", "tool_call_id", "tool_calls"):
                         del msg[key]
 
-                # Validate content
                 if isinstance(msg.get("content"), list):
                     litellm_req["messages"][i]["content"] = f"Content as JSON: {json.dumps(msg.get('content'))}"
                 elif msg.get("content") is None:
@@ -968,12 +933,9 @@ async def create_message(request: MessagesRequest, raw_request: Request):
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(request: TokenCountRequest, raw_request: Request):
-    """Count tokens for a request - applies CUSTOM_MODEL override."""
+    """Count tokens for a request."""
     try:
         display_model = _strip_model(request.original_model or request.model)
-
-        # Apply CUSTOM_MODEL override for token counting
-        model_for_count = _apply_custom_override(_map_model_name(request.model))
 
         converted = convert_anthropic_to_litellm(
             MessagesRequest(
@@ -987,25 +949,14 @@ async def count_tokens(request: TokenCountRequest, raw_request: Request):
             )
         )
 
-        num_tools = len(request.tools) if request.tools else 0
-
         log_request_beautifully(
             "POST", raw_request.url.path, display_model,
-            model_for_count,
+            converted["model"],
             len(converted["messages"]),
-            num_tools, 200
+            len(request.tools or []), 200
         )
 
-        token_counter_args = {"model": model_for_count, "messages": converted["messages"]}
-
-        if PREFERRED_PROVIDER == "custom" and CUSTOM_BASE_URL:
-            token_counter_args["api_base"] = CUSTOM_BASE_URL
-        elif PREFERRED_PROVIDER == "azure" and AZURE_BASE_URL:
-            token_counter_args["api_base"] = AZURE_BASE_URL
-            token_counter_args["api_version"] = AZURE_API_VERSION
-        elif PREFERRED_PROVIDER == "openai" and OPENAI_BASE_URL:
-            token_counter_args["api_base"] = OPENAI_BASE_URL
-
+        token_counter_args = {"model": converted["model"], "messages": converted["messages"]}
         token_count = token_counter(**token_counter_args)
         return TokenCountResponse(input_tokens=token_count)
 

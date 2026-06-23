@@ -1,6 +1,5 @@
-# Environment variables
-.env
-.env.backup
+# Configuration
+config.json
 
 # Python
 __pycache__/

@@ -131,7 +131,6 @@ dependencies = [
     { name = "httpx" },
     { name = "litellm" },
     { name = "pydantic" },
-    { name = "python-dotenv" },
     { name = "uvicorn" },
 ]
 
@@ -143,7 +142,6 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.25.0" },
     { name = "litellm", specifier = ">=1.77.7" },
     { name = "pydantic", specifier = ">=2.0.0" },
-    { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "uvicorn", specifier = ">=0.34.0" },
 ]
 
