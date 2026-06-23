@@ -151,6 +151,16 @@ def _strip_model(model: str) -> str:
     return model.split("/")[-1] if "/" in model else model
 
 
+def _strip_tool_blocks(content: Any) -> Any:
+    """Remove tool_use/tool_result blocks from message content for custom endpoints."""
+    if not isinstance(content, list):
+        return content
+    return [
+        b for b in content
+        if not (isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result"))
+    ]
+
+
 def _apply_custom_override(model: str) -> str:
     """Strip openai/ prefix from model when using a custom base URL."""
     cfg = _provider_config(PREFERRED_PROVIDER)
@@ -780,6 +790,13 @@ async def create_message(request: MessagesRequest, raw_request: Request):
             litellm_req["api_base"] = cfg["base_url"]
             litellm_req["custom_llm_provider"] = "openai"
             litellm_req["drop_params"] = True
+            # Custom endpoints may not support all OpenAI params
+            litellm_req.pop("system", None)
+            # Strip tool_use/tool_result blocks - custom endpoints don't support them
+            litellm_req["messages"] = [
+                {**m, "content": _strip_tool_blocks(m.get("content"))}
+                for m in litellm_req.get("messages", [])
+            ]
             # Ensure openai/ prefix so LiteLLM doesn't add another one
             if not litellm_req["model"].startswith("openai/"):
                 litellm_req["model"] = "openai/" + litellm_req["model"]
