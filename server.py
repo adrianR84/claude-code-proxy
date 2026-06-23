@@ -957,11 +957,6 @@ async def count_tokens(request: TokenCountRequest, raw_request: Request):
         )
 
         token_counter_args = {"model": converted["model"], "messages": converted["messages"]}
-
-        cfg = _provider_config(PREFERRED_PROVIDER)
-        if cfg.get("base_url"):
-            token_counter_args["api_base"] = cfg["base_url"]
-
         token_count = token_counter(**token_counter_args)
         return TokenCountResponse(input_tokens=token_count)
 
