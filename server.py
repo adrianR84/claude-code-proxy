@@ -790,13 +790,13 @@ async def create_message(request: MessagesRequest, raw_request: Request):
             litellm_req["api_base"] = cfg["base_url"]
             litellm_req["custom_llm_provider"] = "openai"
             litellm_req["drop_params"] = True
-            # Custom endpoints may not support all OpenAI params
-            litellm_req.pop("system", None)
-            # Strip tool_use/tool_result blocks - custom endpoints don't support them
-            litellm_req["messages"] = [
-                {**m, "content": _strip_tool_blocks(m.get("content"))}
-                for m in litellm_req.get("messages", [])
-            ]
+            # jatevo doesn't support system or tool blocks
+            if "jatevo" in cfg["base_url"]:
+                litellm_req.pop("system", None)
+                litellm_req["messages"] = [
+                    {**m, "content": _strip_tool_blocks(m.get("content"))}
+                    for m in litellm_req.get("messages", [])
+                ]
             # Ensure openai/ prefix so LiteLLM doesn't add another one
             if not litellm_req["model"].startswith("openai/"):
                 litellm_req["model"] = "openai/" + litellm_req["model"]
