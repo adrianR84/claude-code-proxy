@@ -31,8 +31,6 @@ make run-prod   # prod
 
 ## Configure Claude Code
 
-**Configuration is done in `config.json` — see examples below.**
-
 ```bash
 # Standard
 ANTHROPIC_BASE_URL=http://localhost:8082 claude
