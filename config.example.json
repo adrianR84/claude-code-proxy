@@ -1,0 +1,25 @@
+{
+  "preferred_provider": "openai",
+  "big_model": "gpt-5.5",
+  "small_model": "gpt-5.4-mini",
+  "openai_models": [
+    "o3-mini", "o1", "o1-mini", "o1-pro", "gpt-4.5-preview", "gpt-4o",
+    "gpt-4o-audio-preview", "chatgpt-4o-latest", "gpt-4o-mini",
+    "gpt-4o-mini-audio-preview", "gpt-4.1", "gpt-4.1-mini", "gpt-5.5",
+    "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"
+  ],
+  "gemini_models": [
+    "gemini-2.5-flash", "gemini-2.5-pro", "gemini-3.1-pro", "gemini-3.5-pro",
+    "gemini-3.5-flash", "gemini-3-flash", "gemini-3.1-flash-lite"
+  ],
+  "providers": {
+    "anthropic": { "api_key": null },
+    "openai": { "api_key": null },
+    "google": { "api_key": null },
+    "azure": { "api_key": null, "base_url": null, "api_version": "2024-06-01" },
+    "vertex": { "project": null, "location": null, "use_auth": false },
+    "custom_1": { "model": null, "api_key": null, "base_url": null },
+    "custom_2": { "model": null, "api_key": null, "base_url": null },
+    "custom_3": { "model": null, "api_key": null, "base_url": null }
+  }
+}
